@@ -1,0 +1,126 @@
+name: Go CI
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  sast_scan:
+    env:
+      GO111MODULE: on
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Gosec Security Scanner
+      uses: securego/gosec@master
+      with:
+        args: '-fmt=json -out=scan.json -stdout -verbose=text *.go -exclude-generated ./...'
+    - name: Upload Gosec results
+      uses: actions/upload-artifact@v2
+      with:
+        name: gosec-results
+        path: scan.json
+
+  release:
+    runs-on: ${{matrix.os}}
+    needs:
+      - sast_scan
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21.6'  # Specify your Go version here
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            /go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Lint the code
+        run: |
+          go install golang.org/x/lint/golint@latest
+          golint ./...
+
+      - name: Run static analysis
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+
+      - name: Run all tests
+        run: go test -v ./...
+
+      - name: Test with race detector
+        run: go test -v -race ./...
+
+      - name: Generate test coverage report
+        run: go test -coverprofile=coverage.out ./...
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }} # Change the AWS access key ID and secret access key here
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # Change the AWS secret access key here
+          aws-region: ap-southeast-1 # Change the AWS region here
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Get timestamp
+        id: get-timestamp
+        run: echo "::set-output name=timestamp::$(date +'%Y-%m-%d-%H-%M')"
+
+      - name: Build Test Image
+        id: build-image-test
+        run: |
+          docker build -t app:latest .
+
+      - name: Docker Scount Setup and Scan
+        uses: docker/scout-action@v1.0.9
+        with:
+          dockerhub-user: ${{ secrets.DOCKERHUB_USER }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          command: quickview,cves
+          only-severities: critical,high
+
+      - name: Build and Push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ecr_repo # Change the ECR repository name here
+          IMAGE_TAG: ${{ steps.get-timestamp.outputs.timestamp }} # Change the Docker image tag here
+        run: |
+          docker tag app:latest $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
